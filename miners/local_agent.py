@@ -56,10 +56,15 @@ def _build_local_runtime_bootstrap_command() -> str:
     return (
         f"python3 -c {shlex.quote(probe)}"
         " || ("
+        # Some local images do not ship with pip/ensurepip. Keep this step
+        # best-effort so miner execution can proceed with preinstalled deps.
         "python3 -m pip --version >/dev/null 2>&1"
-        " || python3 -m ensurepip --upgrade; "
-        f"python3 -m pip install --no-cache-dir {packages}"
-        f" || python3 -m pip install --break-system-packages --no-cache-dir {packages}"
+        " || python3 -m ensurepip --upgrade >/dev/null 2>&1"
+        " || true; "
+        "(python3 -m pip --version >/dev/null 2>&1"
+        f" && (python3 -m pip install --no-cache-dir {packages}"
+        f" || python3 -m pip install --break-system-packages --no-cache-dir {packages})"
+        " || echo '[local_agent] pip unavailable; skipping baseline package install')"
         ")"
     )
 

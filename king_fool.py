@@ -2,7 +2,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import requests
 import subprocess
 import sys
 import textwrap
@@ -14,7 +13,14 @@ import inspect
 import logging
 import threading
 import fnmatch
+import urllib.request
+import urllib.error
 from uuid import uuid4
+
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - depends on sandbox image
+    requests = None
 
 # Retry config: exponential backoff + jitter
 RETRY_INITIAL_WAIT = 0.3
@@ -94,6 +100,47 @@ stream_handler = logging.StreamHandler(sys.stdout)
 stream_handler.setLevel(logging.DEBUG)
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
+
+
+class _SimpleHTTPError(Exception):
+    """HTTP error compatible with requests-style handling."""
+
+    def __init__(self, response: "_SimpleResponse", message: str = "HTTP error"):
+        super().__init__(message)
+        self.response = response
+
+
+class _SimpleResponse:
+    """Small response wrapper used when requests is unavailable."""
+
+    def __init__(self, status_code: int, text: str, headers: Dict[str, str]):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers
+
+    def json(self) -> Dict[str, Any]:
+        return json.loads(self.text or "{}")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise _SimpleHTTPError(self, f"HTTP status {self.status_code}")
+
+
+def _http_post(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: Tuple[int, int]):
+    """POST helper with requests-or-urllib fallback."""
+    if requests is not None:
+        return requests.post(url, json=payload, timeout=timeout, headers=headers)
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=max(timeout)) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return _SimpleResponse(int(getattr(resp, "status", 200)), raw, dict(resp.headers.items()))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        return _SimpleResponse(int(getattr(e, "code", 500)), raw, dict(getattr(e, "headers", {}).items()))
+    except urllib.error.URLError as e:
+        raise ConnectionError(str(e)) from e
 
 # ============================================================================
 # PROMPTS
@@ -177,11 +224,11 @@ def _retry_sleep(attempt: int) -> None:
 
 def _is_retryable_request_error(exc: BaseException) -> bool:
     """True if we should retry (connection, timeout, 429, 5xx)."""
-    if isinstance(exc, requests.exceptions.Timeout):
+    if isinstance(exc, TimeoutError):
         return True
-    if isinstance(exc, requests.exceptions.ConnectionError):
+    if isinstance(exc, ConnectionError):
         return True
-    if isinstance(exc, requests.exceptions.RequestException) and hasattr(exc, "response"):
+    if hasattr(exc, "response"):
         resp = getattr(exc, "response", None)
         if resp is not None and getattr(resp, "status_code", None) in RETRYABLE_HTTP_CODES:
             return True
@@ -235,9 +282,9 @@ class Network:
 
         wait = 1.0
         max_wait = 60.0
-        last_response: requests.Response | None = None
+        last_response = None
         for attempt in range(5):
-            response = requests.post(url, json=request_data, timeout=timeout, headers=headers)
+            response = _http_post(url, payload=request_data, timeout=timeout, headers=headers)
             last_response = response
             if response.status_code == 429 and attempt < 4:
                 retry_after = response.headers.get("Retry-After")
@@ -364,18 +411,21 @@ class Network:
 
                 return next_thought, next_tool_name, next_tool_args, raw_text
 
-            except requests.exceptions.HTTPError as e:
+            except Exception as e:
                 last_exception = e
-                if e.response is not None and e.response.status_code in RETRYABLE_HTTP_CODES:
+                response = getattr(e, "response", None)
+                if response is not None and getattr(response, "status_code", None) in RETRYABLE_HTTP_CODES:
                     if attempt < max_retries - 1:
-                        logger.warning("HTTP %s, retrying...", e.response.status_code)
+                        logger.warning("HTTP %s, retrying...", response.status_code)
                         _retry_sleep(attempt)
                         continue
-                raise
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning("Request error (timeout/connection): %s, retrying...", e)
+                if isinstance(e, (TimeoutError, ConnectionError)):
+                    if attempt < max_retries - 1:
+                        logger.warning("Request error (timeout/connection): %s, retrying...", e)
+                        _retry_sleep(attempt)
+                        continue
+                if _is_retryable_request_error(e) and attempt < max_retries - 1:
+                    logger.warning("Inference error: %s, retrying...", e)
                     _retry_sleep(attempt)
                     continue
                 raise

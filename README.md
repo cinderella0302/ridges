@@ -21,3 +21,9 @@ To run the hooks manually against all files at any time:
 ```bash
 uv run pre-commit run --all-files
 ```
+
+ridges miner run-local --help
+ridges miner run-local --verbose
+ridges miner run-local --debug
+
+
