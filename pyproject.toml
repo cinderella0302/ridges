@@ -1,0 +1,61 @@
+[project]
+name = "ridges-v2"
+version = "0.1.0"
+description = "Decentralized AI software engineers, specializing in a specific task"
+readme = "README.md"
+requires-python = ">=3.12.3, <3.14"
+dependencies = [
+    "aioboto3>=15.0.0",
+    "asyncpg>=0.30.0",
+    "bittensor==10.2.1",
+    "click>=8.1.0",
+    "docker>=7.1.0",
+    "harbor==0.3.0",
+    "httpx>=0.27.0",
+    "openai>=2.7.2",
+    "psutil>=7.0.0",
+    "pydantic>=2.9.2",
+    "python-dotenv>=1.0.0",
+    "python-multipart>=0.0.20",
+    "requests>=2.32.3",
+    "uvicorn>=0.30.5",
+]
+
+[project.optional-dependencies]
+miner = [
+    "InquirerPy>=0.3.4",
+    "rich-click>=1.8.9",
+    "tomli-w>=1.2.0",
+]
+dev = [
+    "pytest>=8.4.2",
+    "pre-commit>=4.6.0",
+    "ruff>=0.15.7",
+]
+
+[project.scripts]
+ridges = "ridges:cli"
+
+# Python formatting and linting configuration
+[tool.flake8]
+max-line-length = 120
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+extend-select = ["I"] # isort
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+py-modules = ["ridges"]
+packages = ["execution", "miners", "miners.cli", "miners.cli.commands", "models", "ridges_harbor"]
+
+[tool.setuptools.package-data]
+miners = ["baseline-requirements.txt", "env.miner.example"]
+

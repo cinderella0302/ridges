@@ -1,0 +1,213 @@
+from typing import List, Optional, Tuple
+from uuid import UUID, uuid4
+
+import utils.logger as logger
+from models.evaluation import Evaluation, EvaluationStatus, HydratedEvaluation
+from models.evaluation_run import EvaluationRun, EvaluationRunErrorCode, EvaluationRunStatus
+from models.evaluation_set import EvaluationSetGroup
+from queries.evaluation_run import create_evaluation_runs, get_all_evaluation_runs_in_evaluation_id
+from queries.evaluation_set import get_all_evaluation_set_problems_in_set_group_in_set_id, get_latest_set_id
+from utils.database import DatabaseConnection, db_operation
+
+
+@db_operation
+async def create_evaluation(conn: DatabaseConnection, agent_id: UUID, validator_hotkey: str, set_id: int) -> UUID:
+    evaluation_id = uuid4()
+
+    await conn.execute(
+        """
+        INSERT INTO evaluations (
+            evaluation_id,
+            agent_id,
+            validator_hotkey,
+            set_id,
+            created_at,
+            evaluation_set_group
+        ) VALUES ($1, $2, $3, $4, NOW(), $5)
+        """,
+        evaluation_id,
+        agent_id,
+        validator_hotkey,
+        set_id,
+        EvaluationSetGroup.from_validator_hotkey(validator_hotkey).value,
+    )
+
+    logger.debug(
+        f"Created evaluation {evaluation_id} for agent {agent_id} with validator hotkey {validator_hotkey} and set ID {set_id}"
+    )
+
+    return evaluation_id
+
+
+@db_operation
+async def create_new_evaluation_and_evaluation_runs(
+    conn: DatabaseConnection, agent_id: UUID, validator_hotkey: str, set_id: int = None
+) -> Optional[Tuple[Evaluation, List[EvaluationRun]]]:
+    if set_id is None:
+        set_id = await get_latest_set_id()
+        if set_id is None:
+            logger.info(
+                f"Skipping evaluation issuance for agent {agent_id}: no Harbor evaluation set has been promoted yet"
+            )
+            return None
+
+    logger.debug(
+        f"Creating new evaluation and evaluation runs for agent {agent_id} with validator hotkey {validator_hotkey} and set ID {set_id}"
+    )
+
+    set_group = EvaluationSetGroup.from_validator_hotkey(validator_hotkey)
+    evaluation_set_problems = await get_all_evaluation_set_problems_in_set_group_in_set_id(set_id, set_group)
+    if not evaluation_set_problems:
+        logger.info(
+            f"Skipping evaluation issuance for agent {agent_id}: set_id {set_id} has no tasks for {set_group.value}"
+        )
+        return None
+
+    logger.debug(f"# of problems in set ID {set_id}, set group {set_group.value}: {len(evaluation_set_problems)}")
+
+    evaluation_id = await create_evaluation(agent_id, validator_hotkey, set_id)
+
+    await create_evaluation_runs(evaluation_id, evaluation_set_problems)
+
+    return await get_evaluation_by_id(evaluation_id), await get_all_evaluation_runs_in_evaluation_id(evaluation_id)
+
+
+@db_operation
+async def get_evaluation_by_id(conn: DatabaseConnection, evaluation_id: UUID) -> Evaluation:
+    response = await conn.fetchrow(
+        """
+        SELECT *
+        FROM evaluations
+        WHERE evaluation_id = $1
+        """,
+        evaluation_id,
+    )
+
+    return Evaluation(**response)
+
+
+@db_operation
+async def get_hydrated_evaluation_by_id(conn: DatabaseConnection, evaluation_id: UUID) -> Optional[HydratedEvaluation]:
+    result = await conn.fetchrow(
+        """
+        SELECT *
+        FROM evaluations_hydrated
+        WHERE evaluation_id = $1
+        """,
+        evaluation_id,
+    )
+
+    if result is None:
+        return None
+
+    return HydratedEvaluation(**result)
+
+
+@db_operation
+async def get_hydrated_evaluation_by_evaluation_run_id(
+    conn: DatabaseConnection, evaluation_run_id: UUID
+) -> Optional[HydratedEvaluation]:
+    result = await conn.fetchrow(
+        """
+        SELECT *
+        FROM evaluations_hydrated
+        WHERE evaluation_id = (SELECT evaluation_id FROM evaluation_runs WHERE evaluation_run_id = $1 LIMIT 1)
+        """,
+        evaluation_run_id,
+    )
+
+    if result is None:
+        return None
+
+    return HydratedEvaluation(**result)
+
+
+@db_operation
+async def get_evaluations_for_agent_id(conn: DatabaseConnection, agent_id: UUID) -> List[Evaluation]:
+    results = await conn.fetch(
+        """
+        SELECT *
+        FROM evaluations
+        WHERE agent_id = $1
+        """,
+        agent_id,
+    )
+
+    return [Evaluation(**evaluation) for evaluation in results]
+
+
+@db_operation
+async def update_evaluation_finished_at(conn: DatabaseConnection, evaluation_id: UUID) -> None:
+    await conn.execute(
+        """
+        UPDATE evaluations
+        SET finished_at = NOW()
+        WHERE evaluation_id = $1
+        """,
+        evaluation_id,
+    )
+
+
+@db_operation
+async def get_num_successful_validator_evaluations_for_agent_id(conn: DatabaseConnection, agent_id: UUID) -> int:
+    return await conn.fetchval(
+        f"""
+        SELECT COUNT(*)
+        FROM evaluations_hydrated
+        WHERE 
+            agent_id = $1
+            AND status = '{EvaluationStatus.success.value}'
+            AND evaluation_set_group = '{EvaluationSetGroup.validator.value}'::EvaluationSetGroup
+        """,
+        agent_id,
+    )
+
+
+@db_operation
+async def set_all_unfinished_evaluation_runs_to_errored(conn: DatabaseConnection, error_message: str) -> None:
+    await conn.execute(
+        f"""
+        UPDATE evaluation_runs
+        SET
+            status = '{EvaluationRunStatus.error.value}',
+            error_code = CASE
+                WHEN status = '{EvaluationRunStatus.pending.value}' THEN {EvaluationRunErrorCode.VALIDATOR_FAILED_PENDING.value}
+                WHEN status = '{EvaluationRunStatus.initializing_agent.value}' THEN {EvaluationRunErrorCode.VALIDATOR_FAILED_INIT_AGENT.value}
+                WHEN status = '{EvaluationRunStatus.running_agent.value}' THEN {EvaluationRunErrorCode.VALIDATOR_FAILED_RUNNING_AGENT.value}
+                WHEN status = '{EvaluationRunStatus.initializing_eval.value}' THEN {EvaluationRunErrorCode.VALIDATOR_FAILED_INIT_EVAL.value}
+                WHEN status = '{EvaluationRunStatus.running_eval.value}' THEN {EvaluationRunErrorCode.VALIDATOR_FAILED_RUNNING_EVAL.value}
+                ELSE {EvaluationRunErrorCode.VALIDATOR_INTERNAL_ERROR.value}
+            END,
+            error_message = $1,
+            finished_or_errored_at = NOW()
+        WHERE
+            status NOT IN ('{EvaluationRunStatus.finished.value}', '{EvaluationRunStatus.error.value}')
+        """,
+        error_message,
+    )
+
+
+@db_operation
+async def update_unfinished_evaluation_runs_in_evaluation_id_to_errored(
+    conn: DatabaseConnection, evaluation_id: UUID, error_message: str
+) -> None:
+    await conn.execute(
+        f"""
+        UPDATE evaluation_runs
+        SET
+            status = '{EvaluationRunStatus.error.value}',
+            error_code = CASE
+                WHEN status = '{EvaluationRunStatus.pending.value}' THEN {EvaluationRunErrorCode.PLATFORM_RESTARTED_WHILE_PENDING.value}
+                WHEN status = '{EvaluationRunStatus.initializing_agent.value}' THEN {EvaluationRunErrorCode.PLATFORM_RESTARTED_WHILE_INIT_AGENT.value}
+                WHEN status = '{EvaluationRunStatus.running_agent.value}' THEN {EvaluationRunErrorCode.PLATFORM_RESTARTED_WHILE_RUNNING_AGENT.value}
+                WHEN status = '{EvaluationRunStatus.initializing_eval.value}' THEN {EvaluationRunErrorCode.PLATFORM_RESTARTED_WHILE_INIT_EVAL.value}
+                WHEN status = '{EvaluationRunStatus.running_eval.value}' THEN {EvaluationRunErrorCode.PLATFORM_RESTARTED_WHILE_RUNNING_EVAL.value}
+            END,
+            error_message = $2,
+            finished_or_errored_at = NOW()
+        WHERE evaluation_id = $1
+        AND status NOT IN ('{EvaluationRunStatus.finished.value}', '{EvaluationRunStatus.error.value}')
+        """,
+        evaluation_id,
+        error_message,
+    )
